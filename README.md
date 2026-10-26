@@ -23,8 +23,8 @@ The example fits operational workflows such as creating a case note, proposing a
 Requires Node.js 20 or newer.
 
 ```bash
-npm test
-npm run demo
+node --test
+node src/demo.js
 ```
 
 ## Foundry / AIP deployment
