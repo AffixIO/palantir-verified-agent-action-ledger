@@ -1,0 +1,4 @@
+.DS_Store
+.env
+.asdk_logs/
+node_modules/

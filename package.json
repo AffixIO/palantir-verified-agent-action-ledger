@@ -1,0 +1,12 @@
+{
+  "name": "verified-agent-action-ledger",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A capability-gated agent action reference implementation for Palantir AIP / Foundry.",
+  "scripts": {
+    "test": "node --test",
+    "demo": "node src/demo.js"
+  },
+  "license": "Apache-2.0"
+}
