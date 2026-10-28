@@ -8,6 +8,13 @@ const verifier = {
       reason: request.action === 'case.note.create' ? 'capability_valid' : 'scope_not_granted',
       proofReference: 'demo-proof-reference',
       revocationState: 'not_revoked',
+      expiresAt: '2030-01-01T00:00:00.000Z',
+      scope: {
+        agentId: request.agentId,
+        action: request.action,
+        resource: request.resource,
+        capabilityId: request.capabilityId
+      },
       delegationChain: []
     };
   }

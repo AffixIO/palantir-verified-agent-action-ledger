@@ -1,14 +1,24 @@
 import { createHash, randomUUID } from 'node:crypto';
 
+export function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value).sort().filter((key) => value[key] !== undefined).map((key) => [key, canonicalize(value[key])]));
+  }
+  return value;
+}
+
 export function contentDigest(value) {
-  return createHash('sha256').update(JSON.stringify(value)).digest('hex');
+  return createHash('sha256').update(JSON.stringify(canonicalize(value)), 'utf8').digest('hex');
 }
 
 export class InMemoryDecisionStore {
   #rows = [];
 
   async append(decision) {
-    const row = Object.freeze({ ...decision, sequence: this.#rows.length + 1 });
+    const previousRecordDigest = this.#rows.at(-1)?.recordDigest ?? null;
+    const recordDigest = contentDigest({ ...decision, previousRecordDigest });
+    const row = Object.freeze({ ...decision, previousRecordDigest, recordDigest, sequence: this.#rows.length + 1 });
     this.#rows.push(row);
     return row;
   }
@@ -18,10 +28,44 @@ export class InMemoryDecisionStore {
   }
 }
 
+function verificationRequest(request, contentDigestValue) {
+  return {
+    agentId: request.agentId,
+    action: request.action,
+    resource: request.resource,
+    policyVersion: request.policyVersion,
+    capabilityId: request.capabilityId,
+    contentDigest: contentDigestValue,
+  };
+}
+
+function denial(reason, extra = {}) {
+  return { allowed: false, reason, revocationState: extra.revocationState ?? 'unknown', proofReference: extra.proofReference ?? null, delegationChainDigest: contentDigest(extra.delegationChain ?? []) };
+}
+
+function verifyResponse(response, request, now) {
+  if (!response || typeof response !== 'object' || response.allowed !== true) return denial(response?.reason ?? 'verification_denied', response ?? {});
+  if (response.revocationState !== 'not_revoked') return denial('capability_not_active', response);
+  if (!response.proofReference || typeof response.proofReference !== 'string') return denial('proof_reference_missing', response);
+  if (!response.expiresAt || Number.isNaN(Date.parse(response.expiresAt)) || Date.parse(response.expiresAt) <= now.getTime()) return denial('capability_expired', response);
+  const scope = response.scope;
+  if (!scope || typeof scope !== 'object') return denial('verification_scope_missing', response);
+  for (const key of ['agentId', 'action', 'resource', 'capabilityId']) {
+    if (scope[key] !== request[key]) return denial(`verification_scope_mismatch:${key}`, response);
+  }
+  return {
+    allowed: true,
+    reason: response.reason ?? 'allowed',
+    revocationState: response.revocationState,
+    proofReference: response.proofReference,
+    expiresAt: response.expiresAt,
+    delegationChainDigest: contentDigest(response.delegationChain ?? []),
+  };
+}
+
 /**
- * Enforces a decision before an action is executed. The verifier is deliberately
- * injected: production users must connect it to their own AffixIO / BoundProof
- * capability endpoint and their Foundry policy model.
+ * Enforces a verified decision before an action is executed. The verifier is
+ * injected. Production callers must supply an approved capability service.
  */
 export class CapabilityGate {
   constructor({ verifier, decisionStore, now = () => new Date() }) {
@@ -32,16 +76,17 @@ export class CapabilityGate {
 
   async run(request, execute) {
     validateRequest(request);
+    if (typeof execute !== 'function') throw new TypeError('execute must be a function');
     const receivedAt = this.now().toISOString();
     const digest = contentDigest(request.input ?? null);
-    let verification;
-
+    let rawVerification;
     try {
-      verification = await this.verifier.check(request);
-    } catch (error) {
-      verification = { allowed: false, reason: 'verification_unavailable', error: error.message };
+      // The verifier receives no raw action input.
+      rawVerification = await this.verifier.check(verificationRequest(request, digest));
+    } catch {
+      rawVerification = denial('verification_unavailable');
     }
-
+    const verification = verifyResponse(rawVerification, request, this.now());
     const decision = await this.decisionStore.append({
       decisionId: randomUUID(),
       receivedAt,
@@ -50,18 +95,15 @@ export class CapabilityGate {
       resource: request.resource,
       policyVersion: request.policyVersion,
       capabilityId: request.capabilityId,
-      proofReference: verification.proofReference ?? null,
-      delegationChain: verification.delegationChain ?? [],
-      revocationState: verification.revocationState ?? 'unknown',
+      proofReference: verification.proofReference,
+      delegationChainDigest: verification.delegationChainDigest,
+      revocationState: verification.revocationState,
+      expiresAt: verification.expiresAt ?? null,
       contentDigest: digest,
-      allowed: verification.allowed === true,
-      reason: verification.reason ?? (verification.allowed ? 'allowed' : 'denied')
+      allowed: verification.allowed,
+      reason: verification.reason,
     });
-
-    if (!decision.allowed) {
-      return { status: 'denied', decision };
-    }
-
+    if (!decision.allowed) return { status: 'denied', decision };
     try {
       const result = await execute();
       return { status: 'executed', decision, result };
@@ -71,9 +113,8 @@ export class CapabilityGate {
         decisionId: randomUUID(),
         receivedAt: this.now().toISOString(),
         event: 'execution_failed',
-        allowed: true,
         reason: 'execution_failed',
-        executionError: error.message
+        executionErrorDigest: contentDigest(String(error?.message ?? 'execution_error')),
       });
       throw error;
     }
@@ -82,8 +123,6 @@ export class CapabilityGate {
 
 function validateRequest(request) {
   for (const key of ['agentId', 'action', 'resource', 'policyVersion', 'capabilityId']) {
-    if (!request?.[key] || typeof request[key] !== 'string') {
-      throw new TypeError(`${key} must be a non-empty string`);
-    }
+    if (!request?.[key] || typeof request[key] !== 'string') throw new TypeError(`${key} must be a non-empty string`);
   }
 }
